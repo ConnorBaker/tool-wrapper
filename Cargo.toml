@@ -1,0 +1,42 @@
+[package]
+name = "tool-wrapper"
+version = "0.1.0"
+description = "Linux executable wrappers and reproducible artifact editing"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[features]
+wrapper = ["dep:libc", "dep:rustix"]
+publish = ["wrapper", "dep:tempfile"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
+object = { version = "0.41", default-features = false, features = ["archive", "elf", "read_core", "std", "unaligned"] }
+rustix = { version = "1.1", features = ["fs", "process", "termios"], optional = true }
+tempfile = { version = "3.27", default-features = false, optional = true }
+
+[[bin]]
+name = "tool-wrapper"
+required-features = ["wrapper"]
+
+[[example]]
+name = "normalize-ar"
+required-features = ["wrapper"]
+
+[[example]]
+name = "publish-output"
+required-features = ["publish"]
+
+[[example]]
+name = "rewrite-ar"
+required-features = ["wrapper"]
+
+[[example]]
+name = "rewrite-clang-config"
+required-features = ["wrapper"]
+
+[[example]]
+name = "stage-input"
+required-features = ["wrapper"]
