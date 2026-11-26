@@ -1,0 +1,150 @@
+use crate::files::{descriptor_path, same_file};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf, absolute};
+
+/// A deterministic FNV-1a identifier for a sequence of NUL-free fields.
+/// Fields containing NUL can be indistinguishable from multiple shorter fields.
+pub struct StableId(u64);
+
+impl StableId {
+    pub fn new(prefix: &[u8]) -> Self {
+        let mut id = Self(14695981039346656037);
+        id.push(prefix);
+        id
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes.iter().copied().chain([0]) {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(1099511628211);
+        }
+    }
+
+    pub fn finish(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+pub struct ScratchDirectory {
+    path: PathBuf,
+    lease: Option<File>,
+}
+
+fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn descriptor_directory(dir: &File) -> PathBuf {
+    PathBuf::from(descriptor_path(dir))
+}
+
+impl ScratchDirectory {
+    /// Acquire a scratch directory. Relative paths are anchored to the
+    /// current working directory at acquisition.
+    pub fn acquire(path: PathBuf) -> Option<Self> {
+        Self::acquire_with_marker(path, ".tool-wrapper")
+    }
+
+    /// Use the same marker as a previous implementation when migrating scratch directories.
+    pub fn acquire_with_marker(path: PathBuf, marker: &str) -> Option<Self> {
+        let path = absolute(path).ok()?;
+        if Path::new(marker).file_name() != Some(marker.as_ref()) {
+            return None;
+        }
+        let uid = rustix::process::geteuid().as_raw();
+        loop {
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+            let dir = match open_directory(&path) {
+                Ok(dir) => dir,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            let opened = dir.metadata().ok()?;
+            if opened.uid() != uid || opened.mode() & 0o777 != 0o700 {
+                return None;
+            }
+            dir.lock().ok()?;
+            match fs::symlink_metadata(&path) {
+                Ok(current) if same_file(&current, &opened) => {
+                    Self::prepare(&descriptor_directory(&dir), uid, marker)?;
+                    return Some(Self {
+                        path,
+                        lease: Some(dir),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn prepare(dir: &Path, uid: u32, marker: &str) -> Option<()> {
+        let marker_path = dir.join(marker);
+        let mut entries = fs::read_dir(dir).ok()?;
+        match marker_path.symlink_metadata() {
+            Ok(info)
+                if info.is_file() && info.uid() == uid && info.nlink() == 1 && info.len() == 0 =>
+            {
+                for entry in entries {
+                    let entry = entry.ok()?;
+                    if entry.file_name() != marker {
+                        if entry.file_type().ok()?.is_dir() {
+                            fs::remove_dir_all(entry.path()).ok()?;
+                        } else {
+                            fs::remove_file(entry.path()).ok()?;
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && entries.next().is_none() => {
+                OpenOptions::new()
+                    .write(true)
+                    .mode(0o600)
+                    .create_new(true)
+                    .open(marker_path)
+                    .ok()?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn lease(&self) -> Option<&File> {
+        self.lease.as_ref()
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        // A fresh open holds an independent lock. The vendor process tree
+        // or a later invocation may still hold the original lease.
+        let cleanup = open_directory(&descriptor_directory(&lease).join("."));
+        drop(lease);
+        let Ok(cleanup) = cleanup else { return };
+        if cleanup.try_lock().is_err() {
+            return;
+        }
+        if let (Ok(opened), Ok(current)) = (cleanup.metadata(), fs::symlink_metadata(&self.path))
+            && same_file(&opened, &current)
+            && let Err(error) = fs::remove_dir_all(&self.path)
+        {
+            eprintln!("tool wrapper: cannot remove {:?}: {error}", self.path);
+        }
+    }
+}
